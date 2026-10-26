@@ -31,6 +31,9 @@ FILES = {
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".opus", ".wma", ".mp4"}
 ACTIVE = {"queued", "asr", "generating_story", "original_ready", "polishing"}
 MAX_HOTWORD_CHARS = 500
+# The submission entry only ever hands out the video-maker copy, never transcripts or drafts.
+SUBMIT_FILES = ("video_script.md", "video_script.csv", "video_script.json")
+MAX_SUBMIT_ACTIVE = 10  # leaves queue room for the team's own jobs
 
 
 def clean_hotword(value):
@@ -43,6 +46,10 @@ def clean_hotword(value):
     if any(not w.isprintable() for w in words):
         raise ValueError("热词包含无效字符。")
     return " ".join(words) or None
+
+
+def ticket_digest(ticket):
+    return hashlib.sha256(ticket.encode("utf-8")).hexdigest()
 
 
 def app_identity(root):
@@ -99,7 +106,7 @@ def original_file_exists(directory):
 
 
 class AppState:
-    def __init__(self, root=ROOT, python_executable=None, allow_local_paths=True, api_token=None):
+    def __init__(self, root=ROOT, python_executable=None, allow_local_paths=True, api_token=None, submit_code=None):
         self.root = Path(root).resolve()
         storage = os.environ.get("SERVICE_DATA_DIR")
         self.storage = Path(storage).expanduser().resolve() if storage else self.root
@@ -110,6 +117,10 @@ class AppState:
         self.python_executable = python_executable or sys.executable
         self.allow_local_paths = allow_local_paths
         self.api_token = api_token
+        # Loopback is open without a code; a public deployment opens the entry only with one.
+        self.submit_code = submit_code
+        self.submit_enabled = bool(submit_code) or allow_local_paths
+        self.submit_reserved = 0
         self.app_id = app_identity(self.root)
         self.token = secrets.token_urlsafe(32)
         self.instance_id = secrets.token_urlsafe(16)
@@ -170,6 +181,7 @@ class AppState:
 
     def public_job(self, job):
         job = dict(job)
+        job.pop("ticket_hash", None)
         if not self.allow_local_paths:
             job.pop("source", None)
             job.pop("output_path", None)
@@ -255,7 +267,7 @@ class AppState:
             self.jobs[job_id].update(status=status, stage=status, message=message, updated_at=time.time())
             self._save_jobs()
 
-    def enqueue(self, mode, path=None, upload_id=None, result_id=None, hotword=None):
+    def enqueue(self, mode, path=None, upload_id=None, result_id=None, hotword=None, ticket_hash=None):
         if not isinstance(mode, str) or mode not in {"audio", "polish", "resume"}:
             raise ValueError("请选择处理录音或整理已有结果。")
         hotword = clean_hotword(hotword)
@@ -323,10 +335,70 @@ class AppState:
                    "message": "已加入队列", "created_at": time.time(), "updated_at": time.time()}
             if hotword:
                 job["hotword"] = hotword
+            if ticket_hash:
+                job.update(channel="submit", ticket_hash=ticket_hash)
             self.jobs[job_id] = job
             self._save_jobs()
             self.queue.put(job_id)
             return dict(job)
+
+    def reserve_submission(self):
+        """Hold a slot before the body is stored so concurrent uploads cannot overshoot the cap."""
+        with self.lock:
+            active = sum(j["status"] in ACTIVE and "ticket_hash" in j for j in self.jobs.values())
+            if active + self.submit_reserved >= MAX_SUBMIT_ACTIVE:
+                return False
+            self.submit_reserved += 1
+            return True
+
+    def release_submission(self):
+        with self.lock:
+            self.submit_reserved -= 1
+
+    def discard_upload(self, upload_id):
+        with self.lock:
+            entry = self.uploads.pop(upload_id, None)
+            if entry:
+                self._save_json("uploads.json", self.uploads)
+        if entry:
+            (self.upload_dir / entry["file"]).unlink(missing_ok=True)
+
+    def submit(self, upload_id, hotword=None):
+        """Queue a recording from the submission entry; the ticket is the submitter's only key."""
+        ticket = secrets.token_urlsafe(24)
+        self.enqueue("audio", upload_id=upload_id, hotword=hotword, ticket_hash=ticket_digest(ticket))
+        return ticket
+
+    def submission(self, ticket):
+        if not isinstance(ticket, str) or not 20 <= len(ticket) <= 64:
+            return None
+        digest = ticket_digest(ticket)
+        with self.lock:
+            for job in self.jobs.values():
+                if secrets.compare_digest(job.get("ticket_hash", ""), digest):
+                    return dict(job)
+        return None
+
+    def submission_info(self, job):
+        """Status in the submitter's terms: no paths, ids, drafts or internal stage names."""
+        output = Path(job["output_path"])
+        if job["status"] in ACTIVE:
+            with self.lock:
+                ahead = sum(j["status"] in ACTIVE and j["created_at"] < job["created_at"] for j in self.jobs.values())
+            if job["status"] == "queued":
+                message = f"排队中，前面还有 {ahead} 份录音" if ahead else "排队中，马上开始"
+            elif job["status"] == "asr":
+                message = "正在识别录音"
+            else:
+                message = "录音已识别，正在撰写文案"
+            return {"status": "processing", "message": message, "name": job["name"], "files": []}
+        if safe_file(output, "story.json") and not self._busy(output):
+            refresh_video_script(output)
+        files = [{"name": name, "label": FILES[name]} for name in SUBMIT_FILES if safe_file(output, name)]
+        if safe_file(output, "video_script.md"):
+            return {"status": "ready", "message": "文案已生成，可以预览和下载", "name": job["name"], "files": files}
+        return {"status": "failed", "name": job["name"], "files": [],
+                "message": "这份录音没能整理出文案。请确认录音清晰、以老人讲述为主后重新提交；多次失败请联系我们。"}
 
     def _work(self):
         while True:
@@ -476,24 +548,21 @@ class Handler(BaseHTTPRequestHandler):
         if not self._local_request():
             return
         parsed = urlsplit(self.path)
+        if parsed.path == "/submit" or parsed.path.startswith("/submit/"):
+            return self._submit_get(parsed)
         if parsed.path.startswith("/api/") and parsed.path != "/api/health" and not self._authenticated():
             return
         if parsed.path == "/api/health":
             health = {"service": SERVICE, "version": VERSION,
                       "auth_required": bool(self.state.api_token), "local_paths": self.state.allow_local_paths,
-                      "supported_modes": ["audio", "polish", "resume"],
+                      "supported_modes": ["audio", "polish", "resume"], "submit_enabled": self.state.submit_enabled,
                       "max_upload_mb": self.server.max_upload_bytes // (1024 * 1024)}
             if self.state.allow_local_paths:
                 health.update(pid=os.getpid(), port=self.server.server_port,
                               app_id=self.state.app_id, instance_id=self.state.instance_id)
             self._send(200, health)
         elif parsed.path == "/":
-            nonce = secrets.token_urlsafe(18)
-            html = self.state.root.joinpath("web", "index.html").read_text(encoding="utf-8")
-            html = html.replace("__CSRF_TOKEN__", self.state.token).replace("__NONCE__", nonce)
-            policy = (f"default-src 'self'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
-                      "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
-            self._send(200, html, "text/html; charset=utf-8", {"Content-Security-Policy": policy})
+            self._page("index.html")
         elif parsed.path == "/api/jobs":
             self._send(200, {"jobs": [self.state.public_job(j) for j in self.state.list_jobs()]})
         elif parsed.path.startswith("/api/jobs/"):
@@ -505,6 +574,77 @@ class Handler(BaseHTTPRequestHandler):
             self._file(parse_qs(parsed.query, keep_blank_values=True))
         else:
             self._error(404, "页面不存在。")
+
+    def _page(self, name, replacements=None):
+        nonce = secrets.token_urlsafe(18)
+        html = self.state.root.joinpath("web", name).read_text(encoding="utf-8")
+        html = html.replace("__CSRF_TOKEN__", self.state.token).replace("__NONCE__", nonce)
+        for key, value in (replacements or {}).items():
+            html = html.replace(key, value)
+        policy = (f"default-src 'self'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+                  "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+        self._send(200, html, "text/html; charset=utf-8", {"Content-Security-Policy": policy})
+
+    def _submit_get(self, parsed):
+        if parsed.path == "/submit":
+            return self._page("submit.html", {
+                "__SUBMIT_ENABLED__": "true" if self.state.submit_enabled else "false",
+                "__CODE_REQUIRED__": "true" if self.state.submit_code else "false",
+                "__MAX_UPLOAD_MB__": str(self.server.max_upload_bytes // (1024 * 1024))})
+        parts = parsed.path.split("/")
+        # /submit/api/submissions/<ticket>  or  /submit/api/submissions/<ticket>/files/<name>
+        if len(parts) not in {5, 7} or parts[1:4] != ["submit", "api", "submissions"] or (len(parts) == 7 and parts[5] != "files"):
+            return self._error(404, "页面不存在。")
+        job = self.state.submission(parts[4])
+        if job is None:
+            return self._error(404, "没有找到这份提交，请检查链接是否完整。")
+        if len(parts) == 5:
+            return self._send(200, self.state.submission_info(job))
+        name = parts[6]
+        if name not in SUBMIT_FILES or job["status"] in ACTIVE:
+            return self._error(404, "文件尚未生成或不存在。")
+        path = safe_file(job["output_path"], name)
+        if path is None:
+            return self._error(404, "文件尚未生成或不存在。")
+        kind = ("application/json; charset=utf-8" if name.endswith(".json")
+                else "text/csv; charset=utf-8" if name.endswith(".csv") else "text/plain; charset=utf-8")
+        download = parse_qs(parsed.query).get("download") == ["1"]
+        self._send(200, path.read_bytes(), kind, {"Content-Disposition": f'attachment; filename="{name}"'} if download else {})
+
+    def _submit_post(self):
+        if not self.state.submit_enabled:
+            return self._error(404, "提交入口未开放。")
+        if self.headers.get("Origin") is not None:
+            token = self.headers.get("X-CSRF-Token", "")
+            if not secrets.compare_digest(token.encode("utf-8"), self.state.token.encode("utf-8")):
+                return self._error(403, "页面已过期，请刷新后重试。")
+        if self.state.submit_code:
+            supplied = unquote(self.headers.get("X-Access-Code", "")).strip()
+            if not secrets.compare_digest(supplied.encode("utf-8"), self.state.submit_code.encode("utf-8")):
+                return self._error(401, "提交码不正确。")
+        try:
+            hotword = clean_hotword(unquote(self.headers.get("X-Hotword", ""), errors="strict") or None)
+        except (ValueError, UnicodeError) as exc:
+            return self._error(400, str(exc) if isinstance(exc, ValueError) else "热词编码无效。")
+        if self.headers.get("Transfer-Encoding"):
+            return self._error(400, "请求格式无效。")
+        if not self.state.reserve_submission():
+            return self._error(429, "当前提交较多，请过一段时间再提交。")
+        try:
+            upload = self._receive_upload()
+            if upload is None:
+                return
+            try:
+                ticket = self.state.submit(upload["upload_id"], hotword)
+            except (ValueError, OSError) as exc:
+                # No ticket was handed out, so nobody could ever reach this recording.
+                self.state.discard_upload(upload["upload_id"])
+                return self._error(400 if isinstance(exc, ValueError) else 500,
+                                   str(exc) if isinstance(exc, ValueError) else "暂时无法接收录音，请稍后再试。")
+        finally:
+            self.state.release_submission()
+        self._send(202, {"ticket": ticket, "status_url": "/submit/api/submissions/" + ticket,
+                         "page_url": "/submit#" + ticket})
 
     def _file(self, query):
         if any(len(v) != 1 for v in query.values()) or set(query) - {"job_id", "result_id", "name", "download"}:
@@ -537,6 +677,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._local_request():
             return
+        if self.path == "/submit/api/submissions":
+            return self._submit_post()
         if not self._authenticated():
             return
         token = self.headers.get("X-CSRF-Token", "")
@@ -586,24 +728,35 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, "接口不存在。")
 
     def _upload(self):
+        upload = self._receive_upload()
+        if upload is not None:
+            self._send(201, upload)
+
+    def _receive_upload(self):
+        """Store a raw audio body; on failure the error is already sent and None is returned."""
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            return self._error(400, "上传长度无效。")
+            self._error(400, "上传长度无效。")
+            return None
         if length <= 0 or length > self.server.max_upload_bytes:
-            return self._error(413, "音频为空或超过本服务的上传大小限制。")
+            self._error(413, "音频为空或超过本服务的上传大小限制。")
+            return None
         encoded_name = self.headers.get("X-Filename", "")
         if not encoded_name or len(encoded_name) > 2048:
-            return self._error(400, "缺少有效的音频文件名。")
+            self._error(400, "缺少有效的音频文件名。")
+            return None
         try:
             original_name = unquote(encoded_name, errors="strict")
         except UnicodeError:
-            return self._error(400, "音频文件名编码无效。")
+            self._error(400, "音频文件名编码无效。")
+            return None
         # Treat the header as a label, never as a path. Both Windows and POSIX separators are removed.
         cleaned = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", original_name).strip(" .")
         suffix = Path(cleaned).suffix.lower()
         if suffix not in AUDIO_EXTENSIONS:
-            return self._error(400, "不支持此音频格式。")
+            self._error(400, "不支持此音频格式。")
+            return None
         cleaned = (Path(cleaned).stem[:100].rstrip(" .") or "recording") + suffix
         upload_id = secrets.token_hex(16)
         file_name = upload_id + "_" + cleaned
@@ -623,8 +776,9 @@ class Handler(BaseHTTPRequestHandler):
             self.state.register_upload(upload_id, file_name, cleaned, length)
         except OSError:
             temporary.unlink(missing_ok=True)
-            return self._error(400, "上传未完成，请重试。")
-        self._send(201, {"upload_id": upload_id, "name": cleaned, "size": length})
+            self._error(400, "上传未完成，请重试。")
+            return None
+        return {"upload_id": upload_id, "name": cleaned, "size": length}
 
 
 def create_server(host="127.0.0.1", port=8765, root=ROOT, python_executable=None):
@@ -638,6 +792,9 @@ def create_server(host="127.0.0.1", port=8765, root=ROOT, python_executable=None
     origin = urlsplit(public_origin) if public_origin else None
     if origin and (origin.scheme not in {"http", "https"} or not origin.netloc or origin.path or origin.query or origin.fragment or origin.username):
         raise ValueError("SERVICE_PUBLIC_ORIGIN 必须是完整的 http/https 来源，不含路径。")
+    submit_code = os.environ.get("SUBMIT_ACCESS_CODE", "").strip() or None
+    if submit_code and api_token and secrets.compare_digest(submit_code.encode("utf-8"), api_token.encode("utf-8")):
+        raise ValueError("SUBMIT_ACCESS_CODE 不能与 SERVICE_API_TOKEN 相同。")
     upload_limit = int(os.environ.get("MAX_UPLOAD_MB", "256"))
     if not 1 <= upload_limit <= 2048:
         raise ValueError("MAX_UPLOAD_MB 必须为 1–2048。")
@@ -648,7 +805,8 @@ def create_server(host="127.0.0.1", port=8765, root=ROOT, python_executable=None
     server.allowed_origins = {public_origin} if public_origin else set()
     server.max_upload_bytes = upload_limit * 1024 * 1024
     try:
-        server.state = AppState(root, python_executable, allow_local_paths=local, api_token=api_token or None)
+        server.state = AppState(root, python_executable, allow_local_paths=local,
+                                api_token=api_token or None, submit_code=submit_code)
     except Exception:
         server.server_close()
         raise

@@ -46,6 +46,9 @@ if source.name.startswith('fail'):
 '''
 
 
+SUBMIT_PAGE = '<html nonce="__NONCE__">__CSRF_TOKEN__ enabled=__SUBMIT_ENABLED__ code=__CODE_REQUIRED__</html>'
+
+
 def partial_result(directory, missing=()):
     directory.mkdir(parents=True, exist_ok=True)
     fixtures = {"transcript.json": b'[{"start":0,"end":1,"spk":0,"text":"source text"}]',
@@ -68,13 +71,14 @@ class LocalHttpTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        self.stack.enter_context(patch.dict(os.environ, {"SERVICE_API_TOKEN": "", "SERVICE_PUBLIC_ORIGIN": "",
+        self.stack.enter_context(patch.dict(os.environ, {"SUBMIT_ACCESS_CODE": "", "SERVICE_API_TOKEN": "", "SERVICE_PUBLIC_ORIGIN": "",
             "SERVICE_DATA_DIR": "", "SERVICE_ALLOWED_HOSTS": "", "MAX_UPLOAD_MB": "1"}))
         SCRATCH.mkdir(parents=True, exist_ok=True)
         self.root = Path(tempfile.mkdtemp(prefix="case-", dir=SCRATCH)).resolve()
         self.assertEqual(self.root.parent, SCRATCH)
         (self.root / "web").mkdir()
         (self.root / "web/index.html").write_text('<html nonce="__NONCE__">__CSRF_TOKEN__</html>', encoding="utf-8")
+        (self.root / "web/submit.html").write_text(SUBMIT_PAGE, encoding="utf-8")
         (self.root / "recorder.py").write_text(FAKE_RECORDER, encoding="utf-8")
         self.server = service.create_server(host="127.0.0.1", port=0, root=self.root, python_executable=sys.executable)
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": .02}, daemon=True)
@@ -228,6 +232,90 @@ class LocalHttpTests(unittest.TestCase):
         self.assertNotIn("sk-test-only-secret", log)
         self.assertNotIn("fake-token", log)
 
+    def submit(self, filename="张奶奶.wav", content=b"stub audio; never decoded", **headers):
+        status, _, raw = self.request("POST", "/submit/api/submissions", content,
+            {"Content-Type": "application/octet-stream", "X-Filename": quote(filename), **headers}, raw=True)
+        return status, json.loads(raw)
+
+    def test_submission_entry_returns_only_the_video_script(self):
+        status, headers, page = self.request("GET", "/submit")
+        self.assertEqual(status, 200)
+        self.assertIn(b"enabled=true code=false", page)
+        self.assertIn("Content-Security-Policy", headers)
+        status, body = self.submit(**{"X-Hotword": quote("王秀兰 槐树村")})
+        self.assertEqual(status, 202, body)
+        ticket = body["ticket"]
+        self.assertEqual(body["status_url"], "/submit/api/submissions/" + ticket)
+        job = self.wait_job(self.server.state.submission(ticket)["id"])
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["hotword"], "王秀兰 槐树村")
+        # The stub recorder's story has no narration; give it one so the copy can be built.
+        Path(job["output_path"], "story.json").write_text(json.dumps({"title": "回忆", "first_person_script": "我在村里长大。",
+            "scenes": [{"no": 1, "visual": "村口", "narration": "我在村里长大。"}]}, ensure_ascii=False), encoding="utf-8")
+        status, _, raw = self.request("GET", body["status_url"])
+        self.assertEqual(status, 200)
+        info = json.loads(raw)
+        self.assertEqual(info["status"], "ready")
+        self.assertEqual(info["name"], "张奶奶.wav")
+        self.assertTrue({f["name"] for f in info["files"]} <= set(service.SUBMIT_FILES))
+        self.assertNotIn(str(self.root).encode(), raw)
+        status, headers, content = self.request("GET", body["status_url"] + "/files/video_script.md?download=1")
+        self.assertEqual(status, 200)
+        self.assertIn("attachment", headers["Content-Disposition"])
+        self.assertTrue(content)
+        for name in ("story.md", "story_polished.md", "transcript.txt", "manifest.json", "..%2Fjobs.json"):
+            with self.subTest(name=name):
+                status, _, _ = self.request("GET", body["status_url"] + "/files/" + name)
+                self.assertEqual(status, 404)
+        status, _, _ = self.request("GET", "/submit/api/submissions/" + "x" * 32)
+        self.assertEqual(status, 404)
+        status, _, raw = self.request("GET", "/api/jobs")
+        self.assertNotIn(ticket.encode(), raw)
+        self.assertNotIn(b"ticket_hash", raw)
+        self.assertNotIn(ticket.encode(), (self.server.state.data_dir / "jobs.json").read_bytes())
+
+    def test_submission_reports_failure_without_internal_details(self):
+        status, body = self.submit("fail-no-story.wav")
+        self.assertEqual(status, 202, body)
+        job = self.server.state.submission(body["ticket"])
+        self.wait_job(job["id"])
+        for name in ("story.json", "story.md", "video_script.md", "video_script.csv", "video_script.json"):
+            Path(job["output_path"], name).unlink(missing_ok=True)
+        status, _, raw = self.request("GET", body["status_url"])
+        info = json.loads(raw)
+        self.assertEqual(info["status"], "failed")
+        self.assertEqual(info["files"], [])
+        self.assertNotIn("日志", info["message"])
+
+    def test_browser_submission_requires_page_csrf_token(self):
+        origin = {"Origin": f"http://127.0.0.1:{self.server.server_port}"}
+        status, _ = self.submit(**origin)
+        self.assertEqual(status, 403)
+        status, _ = self.submit(**origin, **{"X-CSRF-Token": self.server.state.token})
+        self.assertEqual(status, 202)
+        status, _ = self.submit(**{"X-Hotword": quote("x" * 600)})
+        self.assertEqual(status, 400)
+
+    def test_rejected_submission_leaves_no_stored_recording(self):
+        uploads = set(self.server.state.uploads)
+        with patch.object(service.AppState, "enqueue", side_effect=ValueError("服务正在停止，请重新启动后再提交。")):
+            status, body = self.submit()
+        self.assertEqual(status, 400, body)
+        self.assertEqual(set(self.server.state.uploads), uploads)
+        self.assertEqual([p for p in self.server.state.upload_dir.iterdir()], [])
+        self.assertEqual(self.server.state.submit_reserved, 0)
+
+    def test_submission_slots_are_reserved_before_the_body_is_read(self):
+        state = self.server.state
+        state.submit_reserved = service.MAX_SUBMIT_ACTIVE
+        status, _ = self.submit()
+        self.assertEqual(status, 429)
+        self.assertEqual(state.uploads, {})
+        state.submit_reserved = service.MAX_SUBMIT_ACTIVE - 1
+        status, _ = self.submit()
+        self.assertEqual(status, 202)
+        self.assertEqual(state.submit_reserved, service.MAX_SUBMIT_ACTIVE - 1)
+
     def test_non_loopback_binding_requires_configured_authentication(self):
         with self.assertRaises(ValueError):
             service.create_server(host="0.0.0.0", port=0, root=self.root, python_executable=sys.executable)
@@ -324,7 +412,7 @@ class CloudHttpTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        self.stack.enter_context(patch.dict(os.environ, {"SERVICE_API_TOKEN": self.TOKEN,
+        self.stack.enter_context(patch.dict(os.environ, {"SUBMIT_ACCESS_CODE": "", "SERVICE_API_TOKEN": self.TOKEN,
             "SERVICE_PUBLIC_ORIGIN": "https://voice.example.test", "SERVICE_DATA_DIR": "",
             "SERVICE_ALLOWED_HOSTS": "", "MAX_UPLOAD_MB": "1"}))
         # These cases validate submission and persistence; never start an audio model.
@@ -333,6 +421,7 @@ class CloudHttpTests(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix="case-", dir=SCRATCH)).resolve()
         (self.root / "web").mkdir()
         (self.root / "web/index.html").write_text('<html nonce="__NONCE__">__CSRF_TOKEN__</html>', encoding="utf-8")
+        (self.root / "web/submit.html").write_text(SUBMIT_PAGE, encoding="utf-8")
         (self.root / "recorder.py").write_text(FAKE_RECORDER, encoding="utf-8")
         self.server = service.create_server(host="0.0.0.0", port=0, root=self.root, python_executable=sys.executable)
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": .02}, daemon=True)
@@ -521,6 +610,50 @@ class CloudHttpTests(unittest.TestCase):
         self.assertIn("排队或处理中", json.loads(raw)["error"])
         self.assertEqual(file_hashes(output), before)
         self.assertEqual(len(self.server.state.list_jobs()), 1)
+
+
+    def test_cloud_submission_entry_is_closed_without_an_access_code(self):
+        status, _, page = self.request("GET", "/submit")
+        self.assertEqual(status, 200)
+        self.assertIn(b"enabled=false", page)
+        status, _, _ = self.request("POST", "/submit/api/submissions", b"fake",
+                                    {"X-Filename": "a.wav", "Content-Type": "application/octet-stream"}, raw=True)
+        self.assertEqual(status, 404)
+        self.assertEqual(self.server.state.list_jobs(), [])
+
+    def test_cloud_submission_needs_code_not_team_token_and_is_capped(self):
+        self.server.state.submit_code = "邀请码-2026"
+        self.server.state.submit_enabled = True
+        base = {"X-Filename": "a.wav", "Content-Type": "application/octet-stream"}
+        for code in (None, "wrong", self.TOKEN):
+            with self.subTest(code=code):
+                headers = dict(base, **({"X-Access-Code": quote(code)} if code else {}))
+                status, _, _ = self.request("POST", "/submit/api/submissions", b"fake", headers, raw=True)
+                self.assertEqual(status, 401)
+        self.assertEqual(self.server.state.list_jobs(), [])
+        good = dict(base, **{"X-Access-Code": quote("邀请码-2026")})
+        status, _, raw = self.request("POST", "/submit/api/submissions", b"fake", good, raw=True)
+        self.assertEqual(status, 202, raw)
+        body = json.loads(raw)
+        status, _, raw = self.request("GET", body["status_url"])
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["status"], "processing")
+        status, _, _ = self.request("GET", "/api/jobs")
+        self.assertEqual(status, 401)
+        for _ in range(service.MAX_SUBMIT_ACTIVE - 1):
+            status, _, _ = self.request("POST", "/submit/api/submissions", b"fake", good, raw=True)
+            self.assertEqual(status, 202)
+        uploads = len(self.server.state.uploads)
+        status, _, _ = self.request("POST", "/submit/api/submissions", b"fake", good, raw=True)
+        self.assertEqual(status, 429)
+        self.assertEqual(len(self.server.state.uploads), uploads)
+        status, upload = self.upload()
+        status, _, _ = self.request("POST", "/api/jobs", {"mode": "audio", "upload_id": upload["upload_id"]}, self.authorized())
+        self.assertEqual(status, 202)
+
+    def test_submit_code_must_differ_from_team_token(self):
+        with patch.dict(os.environ, {"SUBMIT_ACCESS_CODE": self.TOKEN}), self.assertRaises(ValueError):
+            service.create_server(host="0.0.0.0", port=0, root=self.root, python_executable=sys.executable)
 
 
 if __name__ == "__main__":

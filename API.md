@@ -48,6 +48,18 @@ except HTTPError as error:
 
 示例把音频读入内存，适用于当前上传上限内的普通文件。上传接口接收原始文件流，并非 multipart 表单；要求 Content-Length，不接受 chunked。浏览器上传由界面自动完成。
 
+## 提交入口（给团队以外的人）
+
+`GET /submit` 是提交页面。程序也可直接调用，不需要 Bearer 令牌，只能拿到视频文案：
+
+| 方法与路径 | 用途 |
+|---|---|
+| `POST /submit/api/submissions` | 请求体为原始音频；请求头 `X-Filename`（URL 编码文件名），可选 `X-Hotword`（URL 编码热词），设置了提交码时需 `X-Access-Code`（URL 编码）。返回 202 `{"ticket":"…","status_url":"…","page_url":"/submit#…"}` |
+| `GET /submit/api/submissions/<ticket>` | `{"status":…,"message":"…","name":"…","files":[…]}`，status 为 `processing`、`ready` 或 `failed` |
+| `GET /submit/api/submissions/<ticket>/files/video_script.md` | 下载文案；也可取 `video_script.csv`、`video_script.json`，附加 `?download=1` 作为附件下载 |
+
+`ticket` 是该提交的唯一凭据，服务端只保存其哈希。云端未设置 `SUBMIT_ACCESS_CODE` 时入口关闭（404）；提交码错误返回 401；入口同时处理中的提交达到 10 份时返回 429。浏览器请求另需页面防跨站令牌，页面已实现。
+
 ## 接口表
 
 | 方法与路径 | 用途 |
