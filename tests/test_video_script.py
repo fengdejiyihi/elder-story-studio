@@ -97,6 +97,19 @@ class VideoScriptTests(unittest.TestCase):
         self.write("manifest.json", {"polish": {"status": "failed", "previous_completed": previous}})
         self.assertEqual(video_script.write_video_script(self.out), "polished")
 
+    def test_polished_copy_is_dropped_after_the_original_is_corrected(self):
+        digest = self.write("story_polished.json", self.polished())
+        accepted = {"status": "completed", "output_hashes": {"story_polished.json": digest},
+                    "input_hashes": video_script._input_snapshot(self.out)}
+        for polish in (accepted, {"status": "failed", "previous_completed": accepted}):
+            with self.subTest(status=polish["status"]):
+                self.write("manifest.json", {"polish": polish})
+                self.write("story.json", STORY)
+                self.assertEqual(video_script.write_video_script(self.out), "polished")
+                self.write("story.json", dict(STORY, title="更正后的标题"))
+                self.assertEqual(video_script.write_video_script(self.out), "original")
+                self.assertEqual(self.built()["title"], "更正后的标题")
+
     def test_quotes_are_located_in_the_recording_across_sentences(self):
         video_script.write_video_script(self.out)
         clips = self.built()["original_voice_clips"]

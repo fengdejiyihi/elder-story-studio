@@ -26,6 +26,7 @@ import uuid
 
 OUTPUT_FILES = ("video_script.md", "video_script.csv", "video_script.json")
 SOURCE_FILES = ("story.json", "story_polished.json", "manifest.json", "transcript.json")
+POLISH_INPUT_FILES = ("story.json", "transcript.json", "story.md", "transcript.txt")  # polish.INPUT_FILES
 CHARS_PER_SECOND = 4.0  # 普通中文配音约每分钟 240 字
 MIN_SHOT_SECONDS = 3
 
@@ -83,6 +84,17 @@ def _find_in_transcript(quote, transcript):
     return rows[first]["start"], rows[last]["end"]
 
 
+def _input_snapshot(result_dir):
+    """Same shape as polish.py records in manifest.polish.input_hashes."""
+    snapshot = {}
+    for name in POLISH_INPUT_FILES:
+        path = Path(result_dir) / name
+        if path.exists():
+            data = path.read_bytes()
+            snapshot[name] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+    return snapshot
+
+
 def choose_story(result_dir):
     """Return (story, version) where version is "polished" or "original"."""
     result_dir = Path(result_dir)
@@ -94,8 +106,13 @@ def choose_story(result_dir):
     accepted = [a for a in accepted if isinstance(a, dict) and a.get("status") == "completed"]
     if accepted and polished_path.is_file():
         digest = hashlib.sha256(polished_path.read_bytes()).hexdigest()
-        expected = [(a.get("output_hashes") or {}).get("story_polished.json") for a in accepted]
-        if digest in expected or (accepted[0] is polish and not expected[0]):
+        snapshot = _input_snapshot(result_dir)
+        for entry in accepted:
+            output = (entry.get("output_hashes") or {}).get("story_polished.json")
+            if (output != digest if output else entry is not polish):
+                continue
+            if entry.get("input_hashes") and entry["input_hashes"] != snapshot:
+                continue  # the original or transcript was corrected after this polish
             story = _read_json(polished_path)
             if isinstance(story, dict) and _text(story.get("first_person_script")):
                 return story, "polished"
