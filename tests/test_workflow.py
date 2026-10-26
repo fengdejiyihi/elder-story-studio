@@ -135,6 +135,14 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual((self.out / "original.m4a").read_bytes(), self.audio.read_bytes())
         self.assertEqual((self.out / "voice/ref_1.wav").read_bytes(), b"immutable stub reference")
         self.assertTrue((self.out / "manifest.json").is_file())
+        # The video handoff still exists, built from the original story.
+        self.assertIn("视频文案已按原稿生成", stdout)
+        self.assertIn(STORY["first_person_script"], (self.out / "video_script.md").read_text(encoding="utf-8"))
+
+    def test_skip_llm_writes_no_video_script(self):
+        code, stdout, _ = self.invoke(self.audio, "-o", self.out, "--skip-llm")
+        self.assertEqual(code, 0, stdout)
+        self.assertFalse((self.out / "video_script.md").exists())
 
     def test_polish_only_calls_no_audio_pipeline_and_preserves_old_files(self):
         before = self.prepare_old_result()

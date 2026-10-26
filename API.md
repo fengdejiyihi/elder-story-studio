@@ -10,6 +10,7 @@ import os
 import time
 from pathlib import Path
 from urllib.parse import quote, urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 base = os.environ.get("ELDER_SERVICE_URL", "http://127.0.0.1:8765")
@@ -34,14 +35,15 @@ while job["status"] not in {"completed", "failed"}:
     job = call("/api/jobs/" + job["id"])["job"]
     print(job["status"], job["message"])
 
-if job["status"] == "completed":
-    query = urlencode({"job_id": job["id"], "name": "story_polished.md"})
-    request = Request(base + "/api/files?" + query,
-                      headers={"Authorization": "Bearer " + token})
+# 只要原稿已生成就有视频文案；整理未通过时文案按原稿生成，并在开头注明。
+query = urlencode({"job_id": job["id"], "name": "video_script.md"})
+request = Request(base + "/api/files?" + query,
+                  headers={"Authorization": "Bearer " + token})
+try:
     with urlopen(request) as response:
-        Path("story_polished.md").write_bytes(response.read())
-else:
-    print("处理未全部完成，请查看任务消息和 manifest；原稿可能已经保存。")
+        Path("video_script.md").write_bytes(response.read())
+except HTTPError as error:
+    print("还没有视频文案，请查看任务消息：", job["message"], error.code)
 ```
 
 示例把音频读入内存，适用于当前上传上限内的普通文件。上传接口接收原始文件流，并非 multipart 表单；要求 Content-Length，不接受 chunked。浏览器上传由界面自动完成。
@@ -52,15 +54,16 @@ else:
 |---|---|
 | `GET /api/health` | 无需令牌的服务身份、鉴权要求和上传大小限制；不返回模型密钥 |
 | `POST /api/uploads` | 上传音频；请求头 `X-Filename` 为 URL 编码文件名；返回 `upload_id` |
-| `POST /api/jobs` | JSON：`{"mode":"audio","upload_id":"…"}`，提交完整解析任务 |
+| `POST /api/jobs` | JSON：`{"mode":"audio","upload_id":"…"}`，提交完整解析任务；可加 `"hotword":"王秀兰 槐树村"`（≤500 字符，空格或逗号分隔）提高专有名词识别率，不填则使用服务端 hotwords.txt |
 | `POST /api/jobs` | JSON：`{"mode":"polish","result_id":"…"}`，仅整理已有结果 |
 | `POST /api/jobs` | JSON：`{"mode":"resume","result_id":"…"}`，转写完成但原稿尚未生成时继续生成文稿 |
 | `GET /api/jobs` | 返回 `{"jobs":[…]}` |
 | `GET /api/jobs/<id>` | 返回 `{"job":{…}}` |
 | `GET /api/results` | 返回已有结果、状态及可下载文件清单 |
 | `GET /api/files?result_id=…&name=story_polished.md` | 获取指定结果文件；也可用 `job_id` 代替 `result_id` |
+| `GET /api/files?job_id=…&name=video_script.md` | 获取给视频制作者的文案；`video_script.csv` 为分镜表，`video_script.json` 为结构化数据 |
 
-文件请求可附加 `download=1`。仅允许读取原稿、转写、整理稿、修改记录和 manifest 等固定文件，不能借该接口读取配置、密钥、任意服务器路径。声音素材完整保存在服务端结果目录中，此版本没有公开音频素材下载接口。
+文件请求可附加 `download=1`。仅允许读取视频文案、原稿、转写、整理稿、修改记录和 manifest 等固定文件，不能借该接口读取配置、密钥、任意服务器路径。声音素材完整保存在服务端结果目录中，此版本没有公开音频素材下载接口。
 
 任务状态通常为 `queued`、`asr`、`original_ready`、`polishing`，恢复文稿时还可出现 `generating_story`，最后为 `completed` 或 `failed`。具体流程可能跳过短暂中间状态。轮询间隔建议 5 秒。失败详情以 `message` 和 `manifest.polish` 为准；整理失败不会删除已经生成的原稿。
 

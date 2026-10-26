@@ -168,6 +168,46 @@ class LocalHttpTests(unittest.TestCase):
         self.assertIn("attachment", headers["Content-Disposition"])
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
 
+    def test_hotword_reaches_recorder_without_becoming_an_option(self):
+        source = self.root / "good.wav"
+        source.write_bytes(b"stub audio; never decoded")
+        status, _, raw = self.post({"mode": "audio", "path": str(source), "hotword": "王秀兰，--skip-llm 槐树村"})
+        self.assertEqual(status, 202)
+        job = self.wait_job(json.loads(raw)["job"]["id"])
+        argv = json.loads(Path(job["output_path"], "worker_arguments.json").read_text(encoding="utf-8"))
+        self.assertEqual(argv[argv.index("--hotword") + 1], "王秀兰 skip-llm 槐树村")
+        self.assertNotIn("--skip-llm", argv)
+
+    def test_hotword_is_rejected_outside_new_audio_and_when_too_long(self):
+        source = self.root / "good.wav"
+        source.write_bytes(b"stub audio; never decoded")
+        output = self.root / "outputs" / "sample"
+        output.mkdir()
+        (output / "story.json").write_text("{}", encoding="utf-8")
+        for payload in ({"mode": "polish", "path": str(output), "hotword": "王秀兰"},
+                        {"mode": "audio", "path": str(source), "hotword": "名" * 501},
+                        {"mode": "audio", "path": str(source), "hotword": ["王秀兰"]}):
+            with self.subTest(payload=str(payload)[:40]):
+                status, _, _ = self.post(payload)
+                self.assertEqual(status, 400)
+        self.assertEqual(self.server.state.list_jobs(), [])
+
+    def test_video_script_is_built_for_listed_results_and_served_as_csv(self):
+        output = self.root / "outputs" / "sample"
+        output.mkdir()
+        story = {"title": "回忆", "first_person_script": "我在村里长大。",
+                 "scenes": [{"no": 1, "visual": "村口", "narration": "我在村里长大。", "mood": "怀念"}]}
+        (output / "story.json").write_text(json.dumps(story, ensure_ascii=False), encoding="utf-8")
+        status, _, raw = self.request("GET", "/api/results")
+        self.assertEqual(status, 200)
+        result = json.loads(raw)["results"][0]
+        self.assertIn("video_script.md", {f["name"] for f in result["files"]})
+        query = urlencode({"result_id": result["id"], "name": "video_script.csv"})
+        status, headers, content = self.request("GET", "/api/files?" + query)
+        self.assertEqual(status, 200)
+        self.assertTrue(headers["Content-Type"].startswith("text/csv"))
+        self.assertIn("村口", content.decode("utf-8-sig"))
+
     def test_failed_worker_job_does_not_block_following_job(self):
         for name in ("fail.wav", "good.wav"):
             (self.root / name).write_bytes(b"stub audio; never decoded")

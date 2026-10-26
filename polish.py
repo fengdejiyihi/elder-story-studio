@@ -1115,6 +1115,9 @@ def main():
     args = parser.parse_args()
     result = polish_result(args.result_dir, model=args.model, max_retries=args.max_retries,
                            progress=lambda message: print(message, flush=True))
+    # The video handoff follows the polished copy when it passes, else the original.
+    from video_script import refresh_video_script
+    refresh_video_script(args.result_dir)
     print(json.dumps({key: result.get(key) for key in ("status", "error_code", "message", "output_files", "run_id")
                       if key in result}, ensure_ascii=False))
     return 0 if result["status"] == "completed" else 1

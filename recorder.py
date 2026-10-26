@@ -16,6 +16,7 @@
     manifest.json                      交付清单
     story_polished.json / .md           整理稿（保留原稿）
     polish_changes.json                修改依据和处理说明
+    video_script.md / .csv / .json     给视频制作者的文案和分镜表
 """
 
 import argparse
@@ -398,12 +399,23 @@ def _generate_and_polish(out_dir, transcript_text, manifest, model=None, skip_po
         result = polish_result(out_dir, model=model,
                                progress=lambda message: print(message, flush=True))
         if result.get("status") != "completed":
+            _report_video_script(out_dir)
             print(f"原始处理完成，文稿整理失败 → {out_dir}", flush=True)
             return 2
     else:
         print("[5/5] 已跳过文稿整理", flush=True)
+    _report_video_script(out_dir)
     print(f"完成 → {out_dir}", flush=True)
     return 0
+
+
+def _report_video_script(out_dir):
+    from video_script import refresh_video_script
+    version = refresh_video_script(out_dir)
+    if version == "polished":
+        print("      视频文案已按整理稿生成：video_script.md / video_script.csv", flush=True)
+    elif version == "original":
+        print("      视频文案已按原稿生成（整理稿未通过核对）：video_script.md / video_script.csv", flush=True)
 
 
 def _recover_manifest(out_dir, sentences):
@@ -504,6 +516,7 @@ def main():
         from polish import polish_result
         result = polish_result(Path(args.polish_only), model=args.llm_model,
                                progress=lambda message: print(message, flush=True))
+        _report_video_script(Path(args.polish_only).resolve())
         if result.get("status") != "completed":
             print("原始资料保留，文稿整理失败。请查看 manifest.json 中的整理状态。", flush=True)
             return 2
