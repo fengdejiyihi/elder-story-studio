@@ -16,10 +16,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from video_script import refresh_video_script
+
 SERVICE = "elder-audio-service"
 VERSION = "1.1.0"
 ROOT = Path(__file__).resolve().parent
 FILES = {
+    "video_script.md": "视频文案", "video_script.csv": "分镜表（Excel）", "video_script.json": "视频文案 JSON",
     "story.md": "原稿", "story.json": "原稿 JSON",
     "story_polished.md": "整理稿", "story_polished.json": "整理稿 JSON",
     "polish_changes.json": "整理记录", "transcript.txt": "转写文本",
@@ -27,6 +30,19 @@ FILES = {
 }
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".opus", ".wma", ".mp4"}
 ACTIVE = {"queued", "asr", "generating_story", "original_ready", "polishing"}
+MAX_HOTWORD_CHARS = 500
+
+
+def clean_hotword(value):
+    """Hotwords are names and places separated by spaces; never command-line options."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > MAX_HOTWORD_CHARS:
+        raise ValueError(f"热词须为不超过 {MAX_HOTWORD_CHARS} 个字符的文本。")
+    words = [w.lstrip("-") for w in re.split(r"[\s,，、;；]+", value) if w.strip("-")]
+    if any(not w.isprintable() for w in words):
+        raise ValueError("热词包含无效字符。")
+    return " ".join(words) or None
 
 
 def app_identity(root):
@@ -167,6 +183,9 @@ class AppState:
         return result_id
 
     def result_info(self, result_id, directory):
+        if safe_file(directory, "story.json") and not self._busy(directory):
+            # Results made before the handoff existed, or re-polished since, get a current copy.
+            refresh_video_script(directory)
         polish_status = None
         manifest_file = safe_file(directory, "manifest.json")
         if manifest_file:
@@ -218,6 +237,10 @@ class AppState:
         entries.sort(key=lambda item: item[1].stat().st_mtime if item[1].exists() else 0, reverse=True)
         return [self.result_info(i, p) for i, p in entries if p.is_dir()]
 
+    def _busy(self, directory):
+        with self.lock:
+            return any(j["status"] in ACTIVE and j.get("output_path") == str(directory) for j in self.jobs.values())
+
     def list_jobs(self):
         with self.lock:
             return [dict(j) for j in reversed(list(self.jobs.values()))]
@@ -232,9 +255,12 @@ class AppState:
             self.jobs[job_id].update(status=status, stage=status, message=message, updated_at=time.time())
             self._save_jobs()
 
-    def enqueue(self, mode, path=None, upload_id=None, result_id=None):
+    def enqueue(self, mode, path=None, upload_id=None, result_id=None, hotword=None):
         if not isinstance(mode, str) or mode not in {"audio", "polish", "resume"}:
             raise ValueError("请选择处理录音或整理已有结果。")
+        hotword = clean_hotword(hotword)
+        if hotword and mode != "audio":
+            raise ValueError("热词只用于识别新录音。")
         if sum(value is not None for value in (path, upload_id, result_id)) != 1:
             raise ValueError("请选择一份音频或已有结果。")
         if path is not None and not self.allow_local_paths:
@@ -295,6 +321,8 @@ class AppState:
             job = {"id": job_id, "mode": mode, "name": display_name, "source": str(candidate),
                    "result_id": result_id, "output_path": str(output), "status": "queued", "stage": "queued",
                    "message": "已加入队列", "created_at": time.time(), "updated_at": time.time()}
+            if hotword:
+                job["hotword"] = hotword
             self.jobs[job_id] = job
             self._save_jobs()
             self.queue.put(job_id)
@@ -315,6 +343,8 @@ class AppState:
         output = Path(job["output_path"])
         if job["mode"] == "audio":
             command = [self.python_executable, "-u", str(self.root / "recorder.py"), job["source"], "-o", str(output)]
+            if job.get("hotword"):
+                command += ["--hotword", job["hotword"]]
             self._update(job_id, "asr", "正在预处理与识别录音")
         elif job["mode"] == "resume":
             if original_file_exists(output):
@@ -356,8 +386,11 @@ class AppState:
                 pass
         polish = manifest.get("polish", {}) if isinstance(manifest, dict) else {}
         polish_status = polish.get("status") if isinstance(polish, dict) else None
+        video = refresh_video_script(output) if safe_file(output, "story.json") else None
         if return_code == 0 and polish_status == "completed" and safe_file(output, "story_polished.md"):
-            self._update(job_id, "completed", "处理完成，原稿和整理稿均可查看与下载")
+            self._update(job_id, "completed", "处理完成，视频文案、原稿和整理稿均可查看与下载")
+        elif safe_file(output, "story.json") and video:
+            self._update(job_id, "failed", "整理稿未通过核对，已按原稿生成视频文案，可以先用；也可选择此结果单独重试整理。")
         elif safe_file(output, "story.json"):
             self._update(job_id, "failed", "原稿已保留，整理未完成。可选择此结果单独重试整理。")
         elif safe_file(output, "transcript.json"):
@@ -496,7 +529,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "文件尚未生成或不存在。")
         if path.stat().st_size > 32 * 1024 * 1024:
             return self._error(413, "文件过大，请从本机结果目录打开。")
-        kind = "application/json; charset=utf-8" if name.endswith(".json") else "text/plain; charset=utf-8"
+        kind = ("application/json; charset=utf-8" if name.endswith(".json")
+                else "text/csv; charset=utf-8" if name.endswith(".csv") else "text/plain; charset=utf-8")
         headers = {"Content-Disposition": f'attachment; filename="{name}"'} if query.get("download") == ["1"] else {}
         self._send(200, path.read_bytes(), kind, headers)
 
@@ -532,7 +566,8 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, OSError) as exc:
                 self._error(400, str(exc) if isinstance(exc, ValueError) else "无法读取结果目录。")
         elif self.path == "/api/jobs":
-            if "mode" not in body or len(body) != 2 or set(body) - {"mode", "path", "upload_id", "result_id"}:
+            sources = set(body) & {"path", "upload_id", "result_id"}
+            if "mode" not in body or len(sources) != 1 or set(body) - {"mode", "path", "upload_id", "result_id", "hotword"}:
                 return self._error(400, "请求须包含 mode，以及 path、upload_id、result_id 中的一项。")
             try:
                 job = self.state.enqueue(**body)

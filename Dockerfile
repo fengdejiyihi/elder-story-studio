@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
     && pip check \
     && python -c "import torch,torchaudio,funasr,modelscope,soundfile,openai,imageio_ffmpeg,subprocess; subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-version'], check=True)"
 
-COPY --chown=app:app recorder.py polish.py service.py export_preview.py ./
+COPY --chown=app:app recorder.py polish.py service.py export_preview.py video_script.py ./
 COPY --chown=app:app hotwords.txt ./
 COPY --chown=app:app web ./web
 USER app

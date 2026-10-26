@@ -8,7 +8,7 @@ import zipfile
 def main():
     root = Path(__file__).resolve().parent
     destination = root.parent / "elder-audio-service-cloud.zip"
-    names = ["recorder.py", "polish.py", "service.py", "make_release.py", "export_preview.py",
+    names = ["recorder.py", "polish.py", "service.py", "make_release.py", "export_preview.py", "video_script.py",
              "requirements.txt", "hotwords.txt", "README.md", "API.md", "CLOUD_DEPLOY.md",
              "Dockerfile", "compose.yaml", ".dockerignore", ".gitignore",
              ".env.example", ".env.cloud.example", "web/index.html",
