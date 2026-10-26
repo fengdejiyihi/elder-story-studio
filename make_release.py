@@ -11,7 +11,7 @@ def main():
     names = ["recorder.py", "polish.py", "service.py", "make_release.py", "export_preview.py", "video_script.py",
              "requirements.txt", "hotwords.txt", "README.md", "API.md", "CLOUD_DEPLOY.md",
              "Dockerfile", "compose.yaml", ".dockerignore", ".gitignore",
-             ".env.example", ".env.cloud.example", "web/index.html",
+             ".env.example", ".env.cloud.example", "web/index.html", "web/submit.html",
              "start_service.ps1", "stop_service.ps1", "启动服务.bat", "停止服务.bat"]
     names += [str(p.relative_to(root)).replace("\\", "/") for p in sorted((root / "tests").glob("test_*.py"))]
     missing = [name for name in names if not (root / name).is_file()]

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>提交录音 · 老人口述故事</title>
+<style nonce="__NONCE__">
+:root{font-family:"Segoe UI","Microsoft YaHei",sans-serif;color:#20302e;background:#f2f4f0;font-size:16px}*{box-sizing:border-box}body{margin:0}main{max-width:760px;margin:0 auto;padding:40px 16px 64px}h1{font-size:28px;letter-spacing:-1px;margin:4px 0 10px}h2{font-size:20px;margin:0 0 12px}p{line-height:1.65}small,.muted{color:#657670}.eyebrow{font-size:12px;letter-spacing:2px;color:#698575}.card{background:#fff;border:1px solid #dce4dc;border-radius:16px;padding:24px;margin-bottom:20px;box-shadow:0 3px 10px #16382405}label{display:block;font-weight:600;margin:18px 0 8px}input{width:100%;font:inherit;border:1px solid #cdd9cf;border-radius:8px;padding:12px;background:#fff;color:inherit}input:focus,button:focus-visible,a:focus-visible{outline:3px solid #bddbca;outline-offset:2px}button,.button{font:inherit;cursor:pointer;border:0;border-radius:8px;padding:11px 17px;background:#245d48;color:#fff;text-decoration:none;display:inline-block}.button.secondary,button.secondary{background:#eaf1eb;color:#265441}button:disabled{opacity:.55;cursor:wait}.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:18px}.notice{border-radius:10px;padding:12px 14px;margin-bottom:16px;background:#e8f2ec;color:#245d48}.notice.error{background:#fbebe8;color:#8b3328}.hidden{display:none!important}.status{font-size:18px;font-weight:600;margin:6px 0}.link{word-break:break-all;font-size:14px;background:#f6f8f5;border-radius:8px;padding:10px;margin:8px 0}pre{white-space:pre-wrap;word-break:break-word;background:#f8faf7;border:1px solid #e3e9e3;border-radius:10px;padding:16px;max-height:70vh;overflow:auto;font-family:inherit;line-height:1.7;margin:16px 0 0}.history a{color:#245d48}.history li{margin:6px 0}
+</style>
+</head>
+<body><main>
+<div class="eyebrow">ELDER STORY STUDIO</div><h1>提交录音，获取视频文案</h1>
+<p class="muted">上传一段老人讲述经历的录音。我们会识别录音、整理老人的经历，生成可以直接用来做视频的文案：配音旁白、分镜，以及制作前需要确认的地方。</p>
+<div id="notice" class="notice hidden" role="status" aria-live="polite"></div>
+<form class="card" id="submit-form">
+<h2>上传录音</h2>
+<label for="audio-file">录音文件</label>
+<input id="audio-file" type="file" required accept="audio/*,.m4a,.mp3,.wav,.aac,.flac,.ogg,.opus,.wma,.mp4">
+<small id="size-help"></small>
+<label for="hotword">录音里出现的人名、地名（可不填）</label>
+<input id="hotword" maxlength="500" placeholder="例如 王秀兰 槐树村 纺织厂" autocomplete="off">
+<small>用空格分开，能让名字识别得更准。</small>
+<div id="code-row" class="hidden"><label for="access-code">提交码</label><input id="access-code" type="password" maxlength="200" autocomplete="off"><small>向提供此页面的人索取。</small></div>
+<div class="actions"><button type="submit" id="submit-button">提交录音</button></div>
+</form>
+<section class="card hidden" id="status-card" aria-live="polite">
+<h2 id="status-name">处理进度</h2>
+<div class="status" id="status-text"></div>
+<p class="muted" id="status-help">一般需要几分钟到半小时，取决于录音长短和排队人数。可以关掉页面，稍后用下面的链接回来查看。</p>
+<div class="link" id="ticket-link"></div>
+<div class="actions"><button type="button" class="secondary" id="copy-link">复制链接</button><a class="button hidden" id="download-md">下载文案</a><a class="button secondary hidden" id="download-csv">下载分镜表（Excel）</a></div>
+<pre id="preview" class="hidden"></pre>
+</section>
+<section class="card hidden" id="history-card"><h2>在这台设备上提交过的录音</h2><ul class="history" id="history"></ul></section>
+</main>
+<script nonce="__NONCE__">
+const csrfToken="__CSRF_TOKEN__",enabled=__SUBMIT_ENABLED__,codeRequired=__CODE_REQUIRED__,maxMb=__MAX_UPLOAD_MB__;
+const $=id=>document.getElementById(id);
+let ticket="",timer=null,shownReady="";
+function notify(message,error=false){$("notice").textContent=message;$("notice").className="notice"+(error?" error":"")+(message?"":" hidden");}
+function saved(){try{return JSON.parse(localStorage.getItem("elder-submissions")||"[]");}catch{return [];}}
+function remember(entry){try{const items=[entry,...saved().filter(i=>i.ticket!==entry.ticket)].slice(0,20);localStorage.setItem("elder-submissions",JSON.stringify(items));}catch{}showHistory();}
+function showHistory(){const items=saved();$("history-card").classList.toggle("hidden",!items.length);$("history").replaceChildren(...items.map(item=>{const li=document.createElement("li"),a=document.createElement("a");a.href="#"+item.ticket;a.textContent=item.name+" · "+new Date(item.at).toLocaleString();li.append(a);return li;}));}
+function fileUrl(name){return "/submit/api/submissions/"+encodeURIComponent(ticket)+"/files/"+name;}
+async function check(){
+  if(!ticket)return;
+  const current=ticket;
+  let data;
+  try{const response=await fetch("/submit/api/submissions/"+encodeURIComponent(current));data=await response.json();if(!response.ok)throw new Error(data.error||"查询失败");}
+  catch(error){if(current===ticket){$("status-text").textContent=error.message;clearTimeout(timer);timer=setTimeout(check,15000);}return;}
+  if(current!==ticket)return;
+  $("status-card").classList.remove("hidden");
+  $("status-name").textContent=data.name;
+  $("status-text").textContent=data.message;
+  $("status-help").classList.toggle("hidden",data.status!=="processing");
+  const names=new Set(data.files.map(f=>f.name));
+  for(const [id,name] of [["download-md","video_script.md"],["download-csv","video_script.csv"]]){$(id).classList.toggle("hidden",!names.has(name));$(id).href=fileUrl(name)+"?download=1";}
+  if(data.status==="ready"&&shownReady!==current){const response=await fetch(fileUrl("video_script.md"));if(response.ok&&current===ticket){$("preview").textContent=await response.text();$("preview").classList.remove("hidden");shownReady=current;}}
+  clearTimeout(timer);
+  if(data.status==="processing")timer=setTimeout(check,5000);
+}
+function showTicket(value){ticket=value;shownReady="";$("preview").classList.add("hidden");$("preview").textContent="";$("status-text").textContent="正在查询…";$("ticket-link").textContent=location.origin+"/submit#"+value;$("status-card").classList.remove("hidden");check();}
+$("copy-link").addEventListener("click",async()=>{try{await navigator.clipboard.writeText($("ticket-link").textContent);notify("链接已复制，保存好它就能随时回来查看。");}catch{notify("无法自动复制，请手动选中链接复制。",true);}});
+$("submit-form").addEventListener("submit",async e=>{
+  e.preventDefault();const button=$("submit-button");button.disabled=true;
+  try{
+    const file=$("audio-file").files[0];
+    if(!file)throw new Error("请先选择录音文件。");
+    if(file.size>maxMb*1024*1024)throw new Error("录音超过 "+maxMb+" MB，请压缩或分段后再提交。");
+    notify("正在上传录音，请不要关闭页面…");
+    const headers={"Content-Type":"application/octet-stream","X-CSRF-Token":csrfToken,"X-Filename":encodeURIComponent(file.name)};
+    const hotword=$("hotword").value.trim();if(hotword)headers["X-Hotword"]=encodeURIComponent(hotword);
+    if(codeRequired)headers["X-Access-Code"]=encodeURIComponent($("access-code").value.trim());
+    const response=await fetch("/submit/api/submissions",{method:"POST",headers,body:file});
+    let data;try{data=await response.json();}catch{throw new Error("服务响应异常，请稍后再试。");}
+    if(!response.ok)throw new Error(data.error||"提交未成功");
+    remember({ticket:data.ticket,name:file.name,at:Date.now()});
+    notify("已收到录音。请保存下面的链接，文案生成后用它查看和下载。");
+    $("submit-form").reset();
+    location.hash=data.ticket;
+  }catch(error){notify(error.message,true);}finally{button.disabled=false;}
+});
+window.addEventListener("hashchange",()=>{const value=location.hash.slice(1);if(value&&value!==ticket)showTicket(value);});
+if(!enabled){$("submit-form").classList.add("hidden");notify("提交入口暂未开放。",true);}
+$("code-row").classList.toggle("hidden",!codeRequired);$("access-code").required=codeRequired;
+$("size-help").textContent="支持 mp3、m4a、wav 等常见格式，单个文件不超过 "+maxMb+" MB。";
+showHistory();
+if(location.hash.length>1)showTicket(location.hash.slice(1));
+</script>
+</body>
+</html>
