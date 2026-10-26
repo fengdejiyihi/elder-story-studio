@@ -1,0 +1,8 @@
+torch
+torchaudio
+funasr>=1.1
+modelscope
+soundfile
+numpy
+openai>=1.0
+imageio-ffmpeg

@@ -1,0 +1,27 @@
+services:
+  elder-audio:
+    build: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      SERVICE_API_TOKEN: ${SERVICE_API_TOKEN:?Set SERVICE_API_TOKEN in the deployment environment}
+      LLM_API_KEY: ${LLM_API_KEY:?Set LLM_API_KEY in the deployment environment}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-pro}
+      SERVICE_DATA_DIR: /data
+      SERVICE_PUBLIC_ORIGIN: ${SERVICE_PUBLIC_ORIGIN:-}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-256}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-4}
+      MKL_NUM_THREADS: ${MKL_NUM_THREADS:-4}
+    volumes:
+      - interview-data:/data
+      - speech-models:/home/app/.cache/modelscope
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  interview-data:
+  speech-models:

@@ -1,0 +1,10 @@
+**
+!Dockerfile
+!requirements.txt
+!recorder.py
+!polish.py
+!export_preview.py
+!service.py
+!hotwords.txt
+!web/
+!web/**
