@@ -120,6 +120,7 @@ class AppState:
         # Loopback is open without a code; a public deployment opens the entry only with one.
         self.submit_code = submit_code
         self.submit_enabled = bool(submit_code) or allow_local_paths
+        self.submit_reserved = 0
         self.app_id = app_identity(self.root)
         self.token = secrets.token_urlsafe(32)
         self.instance_id = secrets.token_urlsafe(16)
@@ -316,8 +317,6 @@ class AppState:
                 raise ValueError("服务正在停止，请重新启动后再提交。")
             if sum(j["status"] in ACTIVE for j in self.jobs.values()) >= 20:
                 raise ValueError("队列已有 20 个任务，请等待部分完成后再提交。")
-            if ticket_hash and sum(j["status"] in ACTIVE and "ticket_hash" in j for j in self.jobs.values()) >= MAX_SUBMIT_ACTIVE:
-                raise ValueError("当前提交较多，请过一段时间再提交。")
             if any(j["status"] in ACTIVE and (j["source"] == str(candidate)
                    or (mode in {"polish", "resume"} and j["output_path"] == str(candidate)))
                    for j in self.jobs.values()):
@@ -343,9 +342,26 @@ class AppState:
             self.queue.put(job_id)
             return dict(job)
 
-    def submit_has_room(self):
+    def reserve_submission(self):
+        """Hold a slot before the body is stored so concurrent uploads cannot overshoot the cap."""
         with self.lock:
-            return sum(j["status"] in ACTIVE and "ticket_hash" in j for j in self.jobs.values()) < MAX_SUBMIT_ACTIVE
+            active = sum(j["status"] in ACTIVE and "ticket_hash" in j for j in self.jobs.values())
+            if active + self.submit_reserved >= MAX_SUBMIT_ACTIVE:
+                return False
+            self.submit_reserved += 1
+            return True
+
+    def release_submission(self):
+        with self.lock:
+            self.submit_reserved -= 1
+
+    def discard_upload(self, upload_id):
+        with self.lock:
+            entry = self.uploads.pop(upload_id, None)
+            if entry:
+                self._save_json("uploads.json", self.uploads)
+        if entry:
+            (self.upload_dir / entry["file"]).unlink(missing_ok=True)
 
     def submit(self, upload_id, hotword=None):
         """Queue a recording from the submission entry; the ticket is the submitter's only key."""
@@ -612,16 +628,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, str(exc) if isinstance(exc, ValueError) else "热词编码无效。")
         if self.headers.get("Transfer-Encoding"):
             return self._error(400, "请求格式无效。")
-        if not self.state.submit_has_room():
+        if not self.state.reserve_submission():
             return self._error(429, "当前提交较多，请过一段时间再提交。")
-        upload = self._receive_upload()
-        if upload is None:
-            return
         try:
-            ticket = self.state.submit(upload["upload_id"], hotword)
-        except (ValueError, OSError) as exc:
-            return self._error(400 if isinstance(exc, ValueError) else 500,
-                               str(exc) if isinstance(exc, ValueError) else "暂时无法接收录音，请稍后再试。")
+            upload = self._receive_upload()
+            if upload is None:
+                return
+            try:
+                ticket = self.state.submit(upload["upload_id"], hotword)
+            except (ValueError, OSError) as exc:
+                # No ticket was handed out, so nobody could ever reach this recording.
+                self.state.discard_upload(upload["upload_id"])
+                return self._error(400 if isinstance(exc, ValueError) else 500,
+                                   str(exc) if isinstance(exc, ValueError) else "暂时无法接收录音，请稍后再试。")
+        finally:
+            self.state.release_submission()
         self._send(202, {"ticket": ticket, "status_url": "/submit/api/submissions/" + ticket,
                          "page_url": "/submit#" + ticket})
 

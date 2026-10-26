@@ -296,6 +296,26 @@ class LocalHttpTests(unittest.TestCase):
         status, _ = self.submit(**{"X-Hotword": quote("x" * 600)})
         self.assertEqual(status, 400)
 
+    def test_rejected_submission_leaves_no_stored_recording(self):
+        uploads = set(self.server.state.uploads)
+        with patch.object(service.AppState, "enqueue", side_effect=ValueError("服务正在停止，请重新启动后再提交。")):
+            status, body = self.submit()
+        self.assertEqual(status, 400, body)
+        self.assertEqual(set(self.server.state.uploads), uploads)
+        self.assertEqual([p for p in self.server.state.upload_dir.iterdir()], [])
+        self.assertEqual(self.server.state.submit_reserved, 0)
+
+    def test_submission_slots_are_reserved_before_the_body_is_read(self):
+        state = self.server.state
+        state.submit_reserved = service.MAX_SUBMIT_ACTIVE
+        status, _ = self.submit()
+        self.assertEqual(status, 429)
+        self.assertEqual(state.uploads, {})
+        state.submit_reserved = service.MAX_SUBMIT_ACTIVE - 1
+        status, _ = self.submit()
+        self.assertEqual(status, 202)
+        self.assertEqual(state.submit_reserved, service.MAX_SUBMIT_ACTIVE - 1)
+
     def test_non_loopback_binding_requires_configured_authentication(self):
         with self.assertRaises(ValueError):
             service.create_server(host="0.0.0.0", port=0, root=self.root, python_executable=sys.executable)

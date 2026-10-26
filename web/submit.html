@@ -58,7 +58,7 @@ async function check(){
   clearTimeout(timer);
   if(data.status==="processing")timer=setTimeout(check,5000);
 }
-function showTicket(value){ticket=value;shownReady="";$("preview").classList.add("hidden");$("preview").textContent="";$("status-text").textContent="正在查询…";$("ticket-link").textContent=location.origin+"/submit#"+value;$("status-card").classList.remove("hidden");check();}
+function showTicket(value){ticket=value;shownReady="";clearTimeout(timer);$("status-name").textContent="处理进度";for(const id of ["download-md","download-csv"]){$(id).classList.add("hidden");$(id).removeAttribute("href");}$("preview").classList.add("hidden");$("preview").textContent="";$("status-text").textContent="正在查询…";$("ticket-link").textContent=location.origin+"/submit#"+value;$("status-card").classList.remove("hidden");check();}
 $("copy-link").addEventListener("click",async()=>{try{await navigator.clipboard.writeText($("ticket-link").textContent);notify("链接已复制，保存好它就能随时回来查看。");}catch{notify("无法自动复制，请手动选中链接复制。",true);}});
 $("submit-form").addEventListener("submit",async e=>{
   e.preventDefault();const button=$("submit-button");button.disabled=true;
