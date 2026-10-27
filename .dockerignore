@@ -5,6 +5,7 @@
 !polish.py
 !export_preview.py
 !video_script.py
+!llm.py
 !service.py
 !hotwords.txt
 !web/

@@ -21,6 +21,8 @@ import shutil
 import sys
 import uuid
 
+import llm
+
 
 OUTPUT_FILES = ("story_polished.json", "story_polished.md", "polish_changes.json")
 INPUT_FILES = ("story.json", "transcript.json", "story.md", "transcript.txt")
@@ -927,14 +929,13 @@ def _polish_locked(result_dir, model, max_retries, progress):
                     continue
         from recorder import load_env_file
         load_env_file()
-        actual_model = model or os.environ.get("LLM_MODEL", "deepseek-v4-pro")
+        actual_model = llm.model_name(model)
         status["model"] = actual_model
-        key = os.environ.get("LLM_API_KEY", "")
-        if not key.strip() or "在这里" in key:
-            raise PolishValidationError("未配置有效 LLM_API_KEY，原始结果已保留。")
-        from openai import OpenAI
-        client = OpenAI(api_key=key, base_url=os.environ.get("LLM_BASE_URL", "https://api.deepseek.com"),
-                        timeout=180.0, max_retries=0)
+        if llm.backend() == "deepseek":
+            key = os.environ.get("LLM_API_KEY", "")
+            if not key.strip() or "在这里" in key:
+                raise PolishValidationError("未配置有效 LLM_API_KEY，原始结果已保留。")
+        client = llm.create_client(key)
         attempts = 1 + max(0, min(1, int(max_retries)))
         for attempt in range(attempts):
             status["attempts"] = attempt + 1
@@ -1047,7 +1048,7 @@ def _polish_locked(result_dir, model, max_retries, progress):
         return completed
     except Exception as exc:
         # SDK exceptions can contain request/response data. Never print/store them.
-        reason = str(exc) if isinstance(exc, PolishValidationError) else "文稿整理未完成，原始结果已保留。"
+        reason = str(exc) if isinstance(exc, (PolishValidationError, llm.LLMBackendError)) else "文稿整理未完成，原始结果已保留。"
         code = "validation_failed" if isinstance(exc, PolishValidationError) else "processing_failed"
         http_status = getattr(exc, "status_code", None)
         if http_status == 402:
