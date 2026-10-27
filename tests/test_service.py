@@ -689,7 +689,7 @@ class TunnelHttpTests(unittest.TestCase):
             service.create_server(host="127.0.0.1", port=0, root=self.root, python_executable=sys.executable)
         self.assertIn("SERVICE_PUBLIC_ORIGIN", str(caught.exception))
 
-    def test_tunnelled_service_behaves_like_cloud_but_start_script_still_finds_it(self):
+    def test_tunnelled_service_behaves_like_cloud_but_scripts_still_find_it(self):
         state = self.server.state
         self.assertIs(state.allow_local_paths, False)
         self.assertIs(state.submit_enabled, True)
@@ -699,9 +699,14 @@ class TunnelHttpTests(unittest.TestCase):
         self.assertIs(health["local_paths"], False)
         self.assertIs(health["auth_required"], True)
         self.assertEqual(health["llm_backend"], "codex")
-        self.assertEqual(health["app_id"], state.app_id)
-        for key in ("pid", "port", "instance_id"):
-            self.assertNotIn(key, health)
+        # start/stop_service.ps1 need these to find and stop their own process.
+        self.assertEqual((health["app_id"], health["instance_id"], health["port"]),
+                         (state.app_id, state.instance_id, self.server.server_port))
+        self.assertEqual(health["pid"], os.getpid())
+        self.assertNotIn(self.TOKEN.encode(), raw)
+        self.assertNotIn(state.token.encode(), raw)
+        status, _, _ = self.request("POST", "/api/shutdown", {}, {"X-CSRF-Token": state.token})
+        self.assertEqual(status, 401, "shutdown also needs the access token")
         status, _, _ = self.request("GET", "/api/results", headers={"Host": "audio.example.test"})
         self.assertEqual(status, 401)
         source = self.root / "server-file.wav"

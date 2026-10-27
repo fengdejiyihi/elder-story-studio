@@ -10,7 +10,15 @@ try {
         throw '此端口不属于记录中的本机服务，未执行停止操作。'
     }
     $taskHeaders = @{'X-CSRF-Token'=[string]$taskState.token}
-    if ($env:SERVICE_API_TOKEN) { $taskHeaders['Authorization'] = 'Bearer ' + $env:SERVICE_API_TOKEN }
+    $taskApiToken = $env:SERVICE_API_TOKEN
+    $taskEnvFile = Join-Path $PSScriptRoot '.env'
+    if (-not $taskApiToken -and (Test-Path -LiteralPath $taskEnvFile -PathType Leaf)) {
+        # Tunnel mode keeps the access token in .env, which service.py reads at start.
+        foreach ($taskLine in Get-Content -LiteralPath $taskEnvFile -Encoding UTF8) {
+            if ($taskLine -match '^\s*(export\s+)?SERVICE_API_TOKEN\s*=\s*(.*?)\s*$') { $taskApiToken = $Matches[2].Trim('"', "'") }
+        }
+    }
+    if ($taskApiToken) { $taskHeaders['Authorization'] = 'Bearer ' + $taskApiToken }
     Invoke-RestMethod -Uri ($taskUrl + '/api/shutdown') -Method Post -ContentType 'application/json' -Headers $taskHeaders -Body '{}' -TimeoutSec 5 | Out-Null
 } catch {
     $taskMessage = '服务未停止。若仍有处理或排队中的任务，请等待完成后再停止；也可检查服务是否已关闭。'

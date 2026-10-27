@@ -563,12 +563,11 @@ class Handler(BaseHTTPRequestHandler):
                       "supported_modes": ["audio", "polish", "resume"], "submit_enabled": self.state.submit_enabled,
                       "llm_backend": self.state.llm_backend,
                       "max_upload_mb": self.server.max_upload_bytes // (1024 * 1024)}
-            if self.state.allow_local_paths:
+            if self.server.loopback:
+                # start/stop_service.ps1 identify their own process by these, also when tunnelled.
+                # None is secret: shutdown still needs the CSRF token from the local state file.
                 health.update(pid=os.getpid(), port=self.server.server_port,
                               app_id=self.state.app_id, instance_id=self.state.instance_id)
-            elif self.server.loopback:
-                # start_service.ps1 recognises its own service by app_id, also when tunnelled.
-                health["app_id"] = self.state.app_id
             self._send(200, health)
         elif parsed.path == "/":
             self._page("index.html")
