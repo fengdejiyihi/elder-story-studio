@@ -32,6 +32,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+import llm
+
 HERE = Path(__file__).resolve().parent
 ASR_SR = 16000
 VOICE_SR = 24000  # CosyVoice / F5-TTS 等主流 TTS 的工作采样率
@@ -50,15 +52,7 @@ def find_ffmpeg():
 
 def load_env_file():
     # 读取项目目录下的 .env(KEY=VALUE,兼容 export 前缀),不覆盖已有环境变量
-    env = HERE / ".env"
-    if not env.exists():
-        return
-    for line in env.read_text(encoding="utf-8-sig").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.removeprefix("export ").split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    llm.load_env_file(HERE)
 
 
 def ffmpeg_convert(src, dst, sr, denoise=False):
@@ -301,20 +295,12 @@ def _parse_story_response(response):
 
 
 def extract_story(transcript_text, model=None):
-    from openai import OpenAI
-
-    client = OpenAI(
-        api_key=os.environ["LLM_API_KEY"],
-        base_url=os.environ.get("LLM_BASE_URL",
-                                "https://api.deepseek.com"),
-        timeout=180.0,
-        max_retries=0,
-    )
+    client = llm.create_client()
     messages = [{"role": "system", "content": STORY_PROMPT},
                 {"role": "user", "content": json.dumps({"transcript": transcript_text}, ensure_ascii=False)}]
     try:
         for attempt in range(2):
-            actual_model = model or os.environ.get("LLM_MODEL", "deepseek-v4-pro")
+            actual_model = llm.model_name(model)
             mode = {"extra_body": {"thinking": {"type": "disabled"}}} if actual_model.startswith(("deepseek-flash", "deepseek-v4-")) else {}
             resp = client.chat.completions.create(
                 model=actual_model,
@@ -387,7 +373,7 @@ def _generate_and_polish(out_dir, transcript_text, manifest, model=None, skip_po
         manifest["polish"] = {"status": "skipped", "reason": "original-story-failed"}
         _write_manifest(out_dir, manifest)
         # SDK exception bodies can contain request data, so only expose known safe errors.
-        detail = str(exc) if isinstance(exc, StoryGenerationError) else type(exc).__name__
+        detail = str(exc) if isinstance(exc, (StoryGenerationError, llm.LLMBackendError)) else type(exc).__name__
         print(f"转写和音色素材已保留，经历提取失败（{detail}）；可使用 --resume-result 继续。", flush=True)
         return 2
     manifest["story"] = "story.json"

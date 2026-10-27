@@ -64,7 +64,7 @@ except HTTPError as error:
 
 | 方法与路径 | 用途 |
 |---|---|
-| `GET /api/health` | 无需令牌的服务身份、鉴权要求和上传大小限制；不返回模型密钥 |
+| `GET /api/health` | 无需令牌的服务身份、鉴权要求、上传大小限制和 `llm_backend`（`deepseek` 或 `codex`）；不返回模型密钥 |
 | `POST /api/uploads` | 上传音频；请求头 `X-Filename` 为 URL 编码文件名；返回 `upload_id` |
 | `POST /api/jobs` | JSON：`{"mode":"audio","upload_id":"…"}`，提交完整解析任务；可加 `"hotword":"王秀兰 槐树村"`（≤500 字符，空格或逗号分隔）提高专有名词识别率，不填则使用服务端 hotwords.txt |
 | `POST /api/jobs` | JSON：`{"mode":"polish","result_id":"…"}`，仅整理已有结果 |
@@ -85,6 +85,7 @@ except HTTPError as error:
 
 - 启用服务令牌时，除首页和健康检查外均要求 `Authorization: Bearer …`。
 - 无 Origin 请求头的程序调用，在 Bearer 校验通过后不需要 CSRF 令牌。浏览器仍需同源校验和页面 CSRF 令牌，网页已实现。
+- 本机监听但设置了 `SERVICE_PUBLIC_ORIGIN`（经内网穿透对外开放）时，与云端相同：必须设置 `SERVICE_API_TOKEN`，不接受服务器文件路径，提交页需 `SUBMIT_ACCESS_CODE`。
 - 默认允许 localhost/127.0.0.1 的 Host。公网域名须配置 `SERVICE_PUBLIC_ORIGIN=https://实际域名`；代理保留 Host。接口不启用任意跨站 CORS。
 - 当前为单服务、单任务队列、单个可信团队共用令牌。不要运行多个进程共享同一数据目录；任务文件持久化不等于分布式队列。
 - 返回 400 表示输入错误，401 表示令牌无效，403 表示访问不允许，413 表示上传超限；请求失败时不要无限自动重试。

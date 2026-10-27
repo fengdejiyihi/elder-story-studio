@@ -89,6 +89,11 @@ class LocalHttpTests(unittest.TestCase):
         self.thread.join(timeout=3)
         self.server.server_close()
         self.assertFalse(self.thread.is_alive())
+        # Let queued stub jobs finish before their directory is removed from under the worker.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and any(
+                j["status"] in service.ACTIVE for j in self.server.state.jobs.values()) and self.server.state.worker.is_alive():
+            time.sleep(.02)
         resolved = self.root.resolve()
         self.assertEqual(resolved.parent, SCRATCH)
         self.assertTrue(resolved.name.startswith("case-"))
@@ -654,6 +659,69 @@ class CloudHttpTests(unittest.TestCase):
     def test_submit_code_must_differ_from_team_token(self):
         with patch.dict(os.environ, {"SUBMIT_ACCESS_CODE": self.TOKEN}), self.assertRaises(ValueError):
             service.create_server(host="0.0.0.0", port=0, root=self.root, python_executable=sys.executable)
+
+
+class TunnelHttpTests(unittest.TestCase):
+    """Loopback bind reached from the internet through Cloudflare Tunnel or frp."""
+    request = LocalHttpTests.request
+    tearDown = LocalHttpTests.tearDown
+    TOKEN = "offline-tunnel-access-token-not-a-real-secret"
+    ORIGIN = "https://audio.example.test"
+
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.dict(os.environ, {"SUBMIT_ACCESS_CODE": "tunnel-code", "SERVICE_API_TOKEN": self.TOKEN,
+            "SERVICE_PUBLIC_ORIGIN": self.ORIGIN, "SERVICE_DATA_DIR": "", "SERVICE_ALLOWED_HOSTS": "",
+            "MAX_UPLOAD_MB": "1", "LLM_BACKEND": "codex"}))
+        self.stack.enter_context(patch.object(service.AppState, "_work", return_value=None))
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="case-", dir=SCRATCH)).resolve()
+        (self.root / "web").mkdir()
+        (self.root / "web/index.html").write_text('<html nonce="__NONCE__">__CSRF_TOKEN__</html>', encoding="utf-8")
+        (self.root / "web/submit.html").write_text(SUBMIT_PAGE, encoding="utf-8")
+        self.server = service.create_server(host="127.0.0.1", port=0, root=self.root, python_executable=sys.executable)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": .02}, daemon=True)
+        self.thread.start()
+
+    def test_public_origin_on_loopback_requires_a_token(self):
+        with patch.dict(os.environ, {"SERVICE_API_TOKEN": ""}), self.assertRaises(ValueError) as caught:
+            service.create_server(host="127.0.0.1", port=0, root=self.root, python_executable=sys.executable)
+        self.assertIn("SERVICE_PUBLIC_ORIGIN", str(caught.exception))
+
+    def test_tunnelled_service_behaves_like_cloud_but_start_script_still_finds_it(self):
+        state = self.server.state
+        self.assertIs(state.allow_local_paths, False)
+        self.assertIs(state.submit_enabled, True)
+        status, _, raw = self.request("GET", "/api/health", headers={"Host": "audio.example.test"})
+        self.assertEqual(status, 200)
+        health = json.loads(raw)
+        self.assertIs(health["local_paths"], False)
+        self.assertIs(health["auth_required"], True)
+        self.assertEqual(health["llm_backend"], "codex")
+        self.assertEqual(health["app_id"], state.app_id)
+        for key in ("pid", "port", "instance_id"):
+            self.assertNotIn(key, health)
+        status, _, _ = self.request("GET", "/api/results", headers={"Host": "audio.example.test"})
+        self.assertEqual(status, 401)
+        source = self.root / "server-file.wav"
+        source.write_bytes(b"private source")
+        status, _, _ = self.request("POST", "/api/jobs", {"mode": "audio", "path": str(source)},
+                                    {"Authorization": "Bearer " + self.TOKEN})
+        self.assertEqual(status, 400)
+
+    def test_browser_on_the_public_origin_can_submit_with_the_code(self):
+        headers = {"Host": "audio.example.test", "Origin": self.ORIGIN, "X-CSRF-Token": self.server.state.token,
+                   "X-Filename": "a.wav", "Content-Type": "application/octet-stream"}
+        status, _, _ = self.request("POST", "/submit/api/submissions", b"fake", headers, raw=True)
+        self.assertEqual(status, 401)
+        status, _, raw = self.request("POST", "/submit/api/submissions", b"fake",
+                                      {**headers, "X-Access-Code": "tunnel-code"}, raw=True)
+        self.assertEqual(status, 202, raw)
+
+    def test_unknown_llm_backend_stops_startup(self):
+        with patch.dict(os.environ, {"LLM_BACKEND": "gpt"}), self.assertRaises(ValueError):
+            service.create_server(host="127.0.0.1", port=0, root=self.root, python_executable=sys.executable)
 
 
 if __name__ == "__main__":

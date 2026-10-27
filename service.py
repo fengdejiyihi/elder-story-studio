@@ -16,6 +16,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import llm
 from video_script import refresh_video_script
 
 SERVICE = "elder-audio-service"
@@ -121,6 +122,10 @@ class AppState:
         self.submit_code = submit_code
         self.submit_enabled = bool(submit_code) or allow_local_paths
         self.submit_reserved = 0
+        try:
+            self.llm_backend = llm.backend()
+        except llm.LLMBackendError as exc:
+            raise ValueError(str(exc)) from None
         self.app_id = app_identity(self.root)
         self.token = secrets.token_urlsafe(32)
         self.instance_id = secrets.token_urlsafe(16)
@@ -556,10 +561,14 @@ class Handler(BaseHTTPRequestHandler):
             health = {"service": SERVICE, "version": VERSION,
                       "auth_required": bool(self.state.api_token), "local_paths": self.state.allow_local_paths,
                       "supported_modes": ["audio", "polish", "resume"], "submit_enabled": self.state.submit_enabled,
+                      "llm_backend": self.state.llm_backend,
                       "max_upload_mb": self.server.max_upload_bytes // (1024 * 1024)}
             if self.state.allow_local_paths:
                 health.update(pid=os.getpid(), port=self.server.server_port,
                               app_id=self.state.app_id, instance_id=self.state.instance_id)
+            elif self.server.loopback:
+                # start_service.ps1 recognises its own service by app_id, also when tunnelled.
+                health["app_id"] = self.state.app_id
             self._send(200, health)
         elif parsed.path == "/":
             self._page("index.html")
@@ -630,6 +639,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "请求格式无效。")
         if not self.state.reserve_submission():
             return self._error(429, "当前提交较多，请过一段时间再提交。")
+        rejected = None
         try:
             upload = self._receive_upload()
             if upload is None:
@@ -639,10 +649,13 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, OSError) as exc:
                 # No ticket was handed out, so nobody could ever reach this recording.
                 self.state.discard_upload(upload["upload_id"])
-                return self._error(400 if isinstance(exc, ValueError) else 500,
-                                   str(exc) if isinstance(exc, ValueError) else "暂时无法接收录音，请稍后再试。")
+                rejected = exc
         finally:
+            # Release before answering, so a client that retries at once sees the slot free.
             self.state.release_submission()
+        if rejected is not None:
+            return self._error(400 if isinstance(rejected, ValueError) else 500,
+                               str(rejected) if isinstance(rejected, ValueError) else "暂时无法接收录音，请稍后再试。")
         self._send(202, {"ticket": ticket, "status_url": "/submit/api/submissions/" + ticket,
                          "page_url": "/submit#" + ticket})
 
@@ -784,11 +797,14 @@ class Handler(BaseHTTPRequestHandler):
 def create_server(host="127.0.0.1", port=8765, root=ROOT, python_executable=None):
     if host not in {"127.0.0.1", "localhost", "0.0.0.0"}:
         raise ValueError("host 必须为 127.0.0.1、localhost 或 0.0.0.0。")
-    local = host in {"127.0.0.1", "localhost"}
+    loopback = host in {"127.0.0.1", "localhost"}
+    public_origin = os.environ.get("SERVICE_PUBLIC_ORIGIN", "").strip().rstrip("/").lower()
+    # A tunnel (Cloudflare Tunnel, frp) reaches a loopback server from the internet, so a public
+    # origin means outsiders can connect even though the bind address is local.
+    local = loopback and not public_origin
     api_token = os.environ.get("SERVICE_API_TOKEN", "").strip()
     if not local and not api_token:
-        raise ValueError("非回环绑定必须设置 SERVICE_API_TOKEN。")
-    public_origin = os.environ.get("SERVICE_PUBLIC_ORIGIN", "").strip().rstrip("/").lower()
+        raise ValueError("非回环绑定或设置了 SERVICE_PUBLIC_ORIGIN（对外开放）时必须设置 SERVICE_API_TOKEN。")
     origin = urlsplit(public_origin) if public_origin else None
     if origin and (origin.scheme not in {"http", "https"} or not origin.netloc or origin.path or origin.query or origin.fragment or origin.username):
         raise ValueError("SERVICE_PUBLIC_ORIGIN 必须是完整的 http/https 来源，不含路径。")
@@ -804,6 +820,7 @@ def create_server(host="127.0.0.1", port=8765, root=ROOT, python_executable=None
         server.allowed_hosts.add(origin.netloc)
     server.allowed_origins = {public_origin} if public_origin else set()
     server.max_upload_bytes = upload_limit * 1024 * 1024
+    server.loopback = loopback
     try:
         server.state = AppState(root, python_executable, allow_local_paths=local,
                                 api_token=api_token or None, submit_code=submit_code)
@@ -820,6 +837,8 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("端口必须为 1–65535。")
+    # Settings in .env (public origin, tokens, LLM backend) apply when started by 启动服务.bat too.
+    llm.load_env_file(ROOT)
     server = create_server(host=args.host, port=args.port)
     state_file = server.state.storage / ".service-state.json"
     record = {"service": SERVICE, "app_id": server.state.app_id, "pid": os.getpid(),
